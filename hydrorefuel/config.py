@@ -77,32 +77,90 @@ class TruckLimits:
         return pressure_mpa <= self.vent_confirm_mpa
 
 
+# 放散段位固定死：先大流量（high）排到切段压力，再小流量（low）收到确认压力。
+# 顺序不允许通过配置翻转，避免"先小后大"把排不尽的余压带进拔管。
+VENT_STAGE_HIGH = "high"
+VENT_STAGE_LOW = "low"
+VENT_STAGE_ORDER = (VENT_STAGE_HIGH, VENT_STAGE_LOW)
+
+# 切段失败两种处置：revert 退回上一段继续放散并重试；hold 停在当前段关阀报警。
+VENT_POLICY_REVERT = "revert"
+VENT_POLICY_HOLD = "hold"
+VENT_SWITCH_POLICIES = (VENT_POLICY_REVERT, VENT_POLICY_HOLD)
+
+
 @dataclass(frozen=True)
 class VentLimits:
-    """放散阀孔径与闩锁约束。"""
+    """两段放散孔径、切段压力与闩锁约束。"""
 
-    orifice_mm: float
+    high_orifice_mm: float
+    low_orifice_mm: float
     rate_coeff: float
     ambient_mpa: float
     latch_travel_mm: float
+    switch_pressure_mpa: float
+    switch_rate_tolerance: float
+    switch_failure_policy: str
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "VentLimits":
+        policy = str(section.get("switch_failure_policy", _MISSING)) if "switch_failure_policy" in section else None
+        if policy is None:
+            raise ConfigError("配置缺少字段 'switch_failure_policy'", component="config")
+        if policy not in VENT_SWITCH_POLICIES:
+            raise ConfigError(
+                f"切段失败策略必须是 {VENT_SWITCH_POLICIES} 之一，收到 {policy!r}",
+                component="config",
+            )
         limits = cls(
-            orifice_mm=_number(section, "orifice_mm", minimum=0.5),
+            high_orifice_mm=_number(section, "high_orifice_mm", minimum=0.5),
+            low_orifice_mm=_number(section, "low_orifice_mm", minimum=0.5),
             rate_coeff=_number(section, "rate_coeff", minimum=0.1),
             ambient_mpa=_number(section, "ambient_mpa", minimum=0.0),
             latch_travel_mm=_number(section, "latch_travel_mm", minimum=1.0),
+            switch_pressure_mpa=_number(section, "switch_pressure_mpa", minimum=0.0),
+            switch_rate_tolerance=_number(section, "switch_rate_tolerance", minimum=0.0),
+            switch_failure_policy=policy,
         )
         if limits.rate_coeff > 1.0:
             raise ConfigError("放散系数不得超过 1.0", component="config")
+        if limits.low_orifice_mm >= limits.high_orifice_mm:
+            raise ConfigError("小流量孔径必须严格小于大流量孔径", component="config")
+        if not 0.0 < limits.switch_rate_tolerance < 1.0:
+            raise ConfigError("切段流量核对公差必须落在 (0, 1) 之间", component="config")
         return limits
 
-    def vent_rate_mpa_per_s(self, pressure_mpa: float) -> float:
-        """按孔口流量估算的压降速率，压力越低放散越慢。"""
+    def orifice_mm(self, stage: str) -> float:
+        """返回指定段位的孔径。"""
+
+        if stage == VENT_STAGE_HIGH:
+            return self.high_orifice_mm
+        if stage == VENT_STAGE_LOW:
+            return self.low_orifice_mm
+        raise ConfigError(f"未知放散段位 {stage!r}，顺序固定为 {VENT_STAGE_ORDER}", component="config")
+
+    def vent_rate_mpa_per_s(self, pressure_mpa: float, stage: str) -> float:
+        """按该段位孔口流量估算的压降速率，压力越低放散越慢。"""
 
         overpressure = max(0.0, pressure_mpa - self.ambient_mpa)
-        return self.rate_coeff * self.orifice_mm * overpressure / 100.0
+        return self._decay_k(stage) * overpressure
+
+    def _decay_k(self, stage: str) -> float:
+        """段位对应的一阶衰减常数（每秒）。"""
+
+        return self.rate_coeff * self.orifice_mm(stage) / 100.0
+
+    def vent_time_s(self, start_mpa: float, end_mpa: float, stage: str) -> float:
+        """从起点压力指数衰减到终点压力所需秒数（步长缩算用）。"""
+
+        import math
+
+        k = self._decay_k(stage)
+        start_over = max(start_mpa, self.ambient_mpa) - self.ambient_mpa
+        end_over = max(end_mpa, self.ambient_mpa) - self.ambient_mpa
+        if start_over <= 0.0 or end_over <= 0.0:
+            return 0.0
+        return math.log(start_over / end_over) / k
 
 
 @dataclass(frozen=True)
@@ -301,11 +359,27 @@ class StationConfig:
             raise ConfigError("station.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        truck = TruckLimits.from_mapping(_section(limits, "truck"))
+        vent = VentLimits.from_mapping(_section(limits, "vent"))
+        # 切段点必须高于拔管确认压力：大段只负责快速排到切段点，剩下的尾压
+        # 必须留给小段收尾，否则"放到位才拔管"没有小段流量可执行。
+        if vent.switch_pressure_mpa <= truck.vent_confirm_mpa:
+            raise ConfigError(
+                "放散切段压力必须高于放散确认压力，保证大段之后还有小流量收尾段",
+                component="config",
+            )
+        if truck.vent_confirm_mpa <= vent.ambient_mpa:
+            raise ConfigError(
+                "放散确认压力必须高于常压，否则小流量段物理上放不到确认值",
+                component="config",
+            )
+        if vent.switch_pressure_mpa >= truck.hose_pressure_max_mpa:
+            raise ConfigError("放散切段压力必须低于软管最高接入压力", component="config")
         return cls(
             name=name,
             storage_root=storage_root,
-            truck=TruckLimits.from_mapping(_section(limits, "truck")),
-            vent=VentLimits.from_mapping(_section(limits, "vent")),
+            truck=truck,
+            vent=vent,
             compressor=CompressorLimits.from_mapping(_section(limits, "comp")),
             buffer=BufferLimits.from_mapping(_section(limits, "buffer")),
             cool=CoolLimits.from_mapping(_section(limits, "cool")),
@@ -335,7 +409,7 @@ def default_config() -> StationConfig:
         name="refueling-control",
         storage_root="var/state",
         truck=TruckLimits(25.0, 1.5, 90.0, 6.0),
-        vent=VentLimits(6.0, 0.9, 0.1, 40.0),
+        vent=VentLimits(9.0, 2.0, 0.9, 0.1, 40.0, 5.0, 0.5, "revert"),
         compressor=CompressorLimits(3.0, 43.0, 0.8, 1.2, 1.5),
         buffer=BufferLimits(42.0, 1.5, 3600.0, 350.0),
         cool=CoolLimits(-40.0, 3.0, 0.6, 20.0),
@@ -359,10 +433,14 @@ def config_to_mapping(cfg: StationConfig) -> dict:
                 "unload_rate_kg_per_min": cfg.truck.unload_rate_kg_per_min,
             },
             "vent": {
-                "orifice_mm": cfg.vent.orifice_mm,
+                "high_orifice_mm": cfg.vent.high_orifice_mm,
+                "low_orifice_mm": cfg.vent.low_orifice_mm,
                 "rate_coeff": cfg.vent.rate_coeff,
                 "ambient_mpa": cfg.vent.ambient_mpa,
                 "latch_travel_mm": cfg.vent.latch_travel_mm,
+                "switch_pressure_mpa": cfg.vent.switch_pressure_mpa,
+                "switch_rate_tolerance": cfg.vent.switch_rate_tolerance,
+                "switch_failure_policy": cfg.vent.switch_failure_policy,
             },
             "comp": {
                 "inlet_min_mpa": cfg.compressor.inlet_min_mpa,

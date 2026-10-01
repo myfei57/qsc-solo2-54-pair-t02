@@ -40,13 +40,14 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
-from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
+from .sequence import fill_vehicle, pressurize_buffer, resume_unload_truck, stop_fill, unload_truck
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
 from .truck.machine import TruckMachine
 from .vent.latch import VentLatch
 from .vent.snapshot import VentSnapshot
+from .vent.staged import StagedVent
 from .vent.valve import VentValve
 
 DEFAULT_UNIT = "station1"
@@ -78,6 +79,7 @@ class Platform:
         self.truck = TruckMachine(self.config.truck)
         self.vent = VentValve(self.config.vent)
         self.vent_latch = VentLatch(self.config.vent.latch_travel_mm)
+        self.staged_vent = StagedVent(self.vent, self.config.vent)
         self.compressor = Compressor(self.config.compressor)
         self.surge = SurgeGuard(self.config.compressor)
         self.bank = BufferBank(self.config.buffer)
@@ -165,7 +167,7 @@ class Platform:
                     step["action"],
                     station=station,
                     op_id=op_id,
-                    severity="notice",
+                    severity=step.get("severity", "notice"),
                     **detail,
                 )
             )
@@ -230,15 +232,50 @@ class Platform:
         target_kg: float = 20.0,
         dt: float = 1.0,
     ) -> dict:
-        """卸氢编排：连接软管 → 卸氢 → 泄压放散 → 拔管。"""
+        """卸氢编排：连接软管 → 卸氢 → 两段泄压放散 → 对账 → 拔管。"""
 
         with self._lock:
             op_id = self.ids.next()
-            report = unload_truck(self.truck, self.vent, self.vent_latch, self.unit, hose_pressure_mpa, target_kg, dt)
+            report = unload_truck(
+                self.truck,
+                self.vent,
+                self.vent_latch,
+                self.staged_vent,
+                self.unit,
+                hose_pressure_mpa,
+                target_kg,
+                dt,
+                run_id=op_id,
+            )
             summary = self._record_operation(op_id, "unload", report)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def resume_unload(self, dt: float = 1.0) -> dict:
+        """放散切段中断（部分失败）排障后续放，沿用同一个放散 run_id。"""
+
+        with self._lock:
+            op_id = self.ids.next()
+            report = resume_unload_truck(
+                self.truck,
+                self.vent,
+                self.vent_latch,
+                self.staged_vent,
+                self.unit,
+                dt=dt,
+            )
+            summary = self._record_operation(op_id, "resume_unload", report)
+            self._operations += 1
+            self._persist()
+            return {**report, **summary}
+
+    def set_vent_switch_jam(self, jammed: bool) -> dict:
+        """设置/清除放散阀切段卡滞，供切段失败演练与排障续放验证。"""
+
+        with self._lock:
+            self.vent.force_switch_jam(jammed)
+            return {"switch_jammed": self.vent.switch_jammed()}
 
     def pressurize(
         self,
@@ -523,6 +560,10 @@ class Platform:
 
         with self._lock:
             self.truck.reset()
+            self.vent.reset()
+            self.staged_vent.reset()
+            if self.vent_latch.is_engaged():
+                self.vent_latch.release()
             self.compressor.reset()
             self.bank.reset()
             self.temperature.reset()
@@ -542,17 +583,33 @@ class Platform:
         return self.truck.snapshot().as_dict()
 
     def vent_snapshot(self) -> dict:
-        """返回放散状态快照。"""
+        """返回放散状态快照（阀位 + 两段放散过程）。"""
 
+        run = self.staged_vent.snapshot()
         return VentSnapshot(
             open=self.vent.is_open(),
+            stage=self.vent.stage(),
+            stage_order=tuple(run["stage_order"]),
             latch_engaged=self.vent_latch.is_engaged(),
             latch_travel_mm=self.vent_latch.travel(),
             latch_cycles=self.vent_latch.cycles(),
             latch_resets=self.vent_latch.resets(),
             bursts=self.vent.bursts(),
+            switches=self.vent.switches(),
+            switch_failures=self.vent.switch_failures(),
+            high_vented_mpa=self.vent.stage_vented_mpa("high"),
+            low_vented_mpa=self.vent.stage_vented_mpa("low"),
             vented_mpa=self.vent.vented_mpa(),
+            run_state=run["state"],
+            switch_pressure_mpa=run["switch_pressure_mpa"],
+            failure_policy=run["failure_policy"],
+            alarm=run["alarm"],
         ).as_dict()
+
+    def vent_run_snapshot(self) -> dict:
+        """返回两段放散过程明细（分段台账 + 切段尝试），供控制台展示。"""
+
+        return self.staged_vent.snapshot()
 
     def compressor_snapshot(self) -> dict:
         """返回压缩机状态快照。"""

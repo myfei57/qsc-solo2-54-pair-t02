@@ -11,10 +11,14 @@
       "unload_rate_kg_per_min": 6.0
     },
     "vent": {
-      "orifice_mm": 6.0,
+      "high_orifice_mm": 9.0,
+      "low_orifice_mm": 2.0,
       "rate_coeff": 0.9,
       "ambient_mpa": 0.1,
-      "latch_travel_mm": 40.0
+      "latch_travel_mm": 40.0,
+      "switch_pressure_mpa": 5.0,
+      "switch_rate_tolerance": 0.5,
+      "switch_failure_policy": "revert"
     },
     "comp": {
       "inlet_min_mpa": 3.0,

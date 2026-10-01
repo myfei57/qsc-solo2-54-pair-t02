@@ -43,6 +43,7 @@ class Api:
         add("GET", "/api/readiness", lambda params, body: self._platform.readiness())
         add("GET", "/api/truck", lambda params, body: {"truck": self._platform.truck_snapshot()})
         add("GET", "/api/vent", lambda params, body: {"vent": self._platform.vent_snapshot()})
+        add("GET", "/api/vent/run", lambda params, body: {"vent_run": self._platform.vent_run_snapshot()})
         add("GET", "/api/compressor", lambda params, body: {"compressor": self._platform.compressor_snapshot()})
         add("GET", "/api/buffer", lambda params, body: {"buffer": self._platform.buffer_snapshot()})
         add("GET", "/api/cool", lambda params, body: {"cool": self._platform.cool_snapshot()})
@@ -59,6 +60,8 @@ class Api:
         add("GET", "/api/journal", self._journal)
         add("POST", "/api/step", self._step)
         add("POST", "/api/unload", self._unload)
+        add("POST", "/api/unload/resume", self._unload_resume)
+        add("POST", "/api/vent/jam", self._vent_jam)
         add("POST", "/api/pressurize", self._pressurize)
         add("POST", "/api/fill", self._fill)
         add("POST", "/api/stop", self._stop)
@@ -148,6 +151,13 @@ class Api:
             target_kg=_as_float(body, "target_kg", 20.0),
             dt=_as_float(body, "dt", 1.0),
         )
+
+    def _unload_resume(self, params: dict, body: dict) -> dict:
+        return self._platform.resume_unload(dt=_as_float(body, "dt", 1.0))
+
+    def _vent_jam(self, params: dict, body: dict) -> dict:
+        jammed = bool(body.get("jammed", True))
+        return self._platform.set_vent_switch_jam(jammed)
 
     def _pressurize(self, params: dict, body: dict) -> dict:
         return self._platform.pressurize(
