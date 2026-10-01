@@ -8,13 +8,23 @@
       "hose_pressure_max_mpa": 25.0,
       "vent_confirm_mpa": 1.5,
       "vent_timeout_s": 90.0,
-      "unload_rate_kg_per_min": 6.0
+      "unload_rate_kg_per_min": 6.0,
+      "vent_kg_per_mpa": 0.6
     },
     "vent": {
       "orifice_mm": 6.0,
+      "small_orifice_mm": 1.5,
       "rate_coeff": 0.9,
       "ambient_mpa": 0.1,
-      "latch_travel_mm": 40.0
+      "latch_travel_mm": 40.0,
+      "switch_mpa": 5.0,
+      "switch_timeout_s": 10.0,
+      "switch_policy": "revert",
+      "rate_band": 0.25,
+      "switch_max_attempts": 2,
+      "reconcile_tolerance": 0.1,
+      "stage1_timeout_s": 90.0,
+      "stage2_timeout_s": 240.0
     },
     "comp": {
       "inlet_min_mpa": 3.0,

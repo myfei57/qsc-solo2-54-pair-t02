@@ -59,6 +59,14 @@ class Api:
         add("GET", "/api/journal", self._journal)
         add("POST", "/api/step", self._step)
         add("POST", "/api/unload", self._unload)
+        add("POST", "/api/unload/resume", lambda params, body: self._platform.resume_unload(
+            dt=_as_float(body, "dt", 1.0)
+        ))
+        add("POST", "/api/vent/recheck", lambda params, body: self._platform.recheck_vent())
+        add("POST", "/api/vent/fault", self._vent_fault)
+        add("POST", "/api/vent/fault/clear", lambda params, body: self._platform.clear_vent_fault())
+        add("POST", "/api/vent/meter_bias", self._vent_meter_bias)
+        add("POST", "/api/vent/meter_calibrate", self._vent_meter_calibrate)
         add("POST", "/api/pressurize", self._pressurize)
         add("POST", "/api/fill", self._fill)
         add("POST", "/api/stop", self._stop)
@@ -148,6 +156,15 @@ class Api:
             target_kg=_as_float(body, "target_kg", 20.0),
             dt=_as_float(body, "dt", 1.0),
         )
+
+    def _vent_fault(self, params: dict, body: dict) -> dict:
+        return self._platform.inject_vent_fault(str(body.get("fault", "small_not_open")))
+
+    def _vent_meter_bias(self, params: dict, body: dict) -> dict:
+        return self._platform.set_vent_meter_bias(_as_float(body, "bias", 0.0))
+
+    def _vent_meter_calibrate(self, params: dict, body: dict) -> dict:
+        return self._platform.calibrate_vent_meter(_as_float(body, "factor", 1.0))
 
     def _pressurize(self, params: dict, body: dict) -> dict:
         return self._platform.pressurize(

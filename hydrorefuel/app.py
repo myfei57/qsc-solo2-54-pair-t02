@@ -26,7 +26,7 @@ from .cool.temperature import TemperatureModel
 from .disp.machine import Dispenser
 from .disp.nozzle import Nozzle
 from .disp.setpoint import SetpointArbiter
-from .errors import HydroError
+from .errors import HydroError, InterlockError
 from .eventbus import Event, EventBus
 from .flow.meter import MassFlowMeter
 from .flow.snapshot import FlowSnapshot
@@ -40,17 +40,20 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
-from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
+from .sequence import fill_vehicle, pressurize_buffer, resume_unload_truck, stop_fill, unload_truck
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
 from .truck.machine import TruckMachine
 from .vent.latch import VentLatch
+from .vent.meter import VentFlowMeter
 from .vent.snapshot import VentSnapshot
+from .vent.staging import VentStaging
 from .vent.valve import VentValve
 
 DEFAULT_UNIT = "station1"
 DEFAULT_VEHICLE = "vehicle01"
+VENT_CHECKPOINT_DOC = "vent_checkpoint"
 
 
 class Platform:
@@ -77,6 +80,8 @@ class Platform:
 
         self.truck = TruckMachine(self.config.truck)
         self.vent = VentValve(self.config.vent)
+        self.vent_meter = VentFlowMeter()
+        self.vent_staging = VentStaging(self.vent, self.vent_meter, self.config.vent, self.config.truck)
         self.vent_latch = VentLatch(self.config.vent.latch_travel_mm)
         self.compressor = Compressor(self.config.compressor)
         self.surge = SurgeGuard(self.config.compressor)
@@ -165,7 +170,7 @@ class Platform:
                     step["action"],
                     station=station,
                     op_id=op_id,
-                    severity="notice",
+                    severity=step.get("severity", "notice"),
                     **detail,
                 )
             )
@@ -230,15 +235,137 @@ class Platform:
         target_kg: float = 20.0,
         dt: float = 1.0,
     ) -> dict:
-        """卸氢编排：连接软管 → 卸氢 → 泄压放散 → 拔管。"""
+        """卸氢编排：连接软管 → 卸氢 → 两段泄压放散（先大后小） → 拔管。"""
 
         with self._lock:
             op_id = self.ids.next()
-            report = unload_truck(self.truck, self.vent, self.vent_latch, self.unit, hose_pressure_mpa, target_kg, dt)
+            report = unload_truck(
+                self.truck,
+                self.vent,
+                self.vent_latch,
+                self.vent_staging,
+                self.unit,
+                hose_pressure_mpa,
+                target_kg,
+                dt,
+            )
+            # 切段中断属于部分失败：检查点落盘，供续放/跨重启使用。
+            if report.get("checkpoint"):
+                self.store.write(VENT_CHECKPOINT_DOC, report["checkpoint"])
+            elif self.store.exists(VENT_CHECKPOINT_DOC):
+                self.store.remove(VENT_CHECKPOINT_DOC)
             summary = self._record_operation(op_id, "unload", report)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def resume_unload(self, dt: float = 1.0) -> dict:
+        """从落盘的放散检查点续放：部分失败接着排到位再拔管。"""
+
+        with self._lock:
+            checkpoint = self.store.read(VENT_CHECKPOINT_DOC)
+            if not isinstance(checkpoint, dict):
+                raise InterlockError("没有可续放的放散检查点", component="vent")
+            op_id = self.ids.next()
+            report = resume_unload_truck(
+                self.truck,
+                self.vent,
+                self.vent_latch,
+                self.vent_staging,
+                self.unit,
+                checkpoint,
+                dt=dt,
+            )
+            if report.get("checkpoint"):
+                self.store.write(VENT_CHECKPOINT_DOC, report["checkpoint"])
+            elif report.get("ok"):
+                # 只有续放真正成功收尾才允许撤检查点；被拒绝时原检查点保留。
+                if self.store.exists(VENT_CHECKPOINT_DOC):
+                    self.store.remove(VENT_CHECKPOINT_DOC)
+            else:
+                self.store.write(VENT_CHECKPOINT_DOC, checkpoint)
+            summary = self._record_operation(op_id, "unload_resume", report)
+            self._operations += 1
+            self._persist()
+            return {**report, **summary}
+
+    def recheck_vent(self) -> dict:
+        """冻结排查后重新核对放散段量；账平了才允许续放。
+
+        核对在内存账册上进行，核对结果同时回写检查点，保证续放/跨重启
+        恢复出来的是修正后的段量。
+        """
+
+        with self._lock:
+            matched = self.vent_staging.recheck()
+            self.bus.publish(
+                Event.of(
+                    "vent",
+                    "vent",
+                    "vent_recheck",
+                    station=self.unit,
+                    severity="notice" if matched else "warning",
+                    matched=matched,
+                )
+            )
+            if self.vent_staging.is_hold():
+                self.store.write(VENT_CHECKPOINT_DOC, self.vent_staging.checkpoint().as_dict())
+            return {"matched": matched, "reconciliation": self.vent_staging.reconcile_report()}
+
+    def inject_vent_fault(self, fault: str) -> dict:
+        """给放散阀挂一次切段故障（仿真/演练注入用）。"""
+
+        with self._lock:
+            self.vent.arm_fault(str(fault))
+            self.bus.publish(
+                Event.of("vent", "vent", "vent_fault_armed", station=self.unit, severity="warning", fault=fault)
+            )
+            return {"fault": fault, "armed": self.vent.fault()}
+
+    def clear_vent_fault(self) -> dict:
+        """清除放散阀挂着的切段故障（仿真/演练注入用）。"""
+
+        with self._lock:
+            self.vent.clear_fault()
+            self.vent_meter.set_bias(0.0)
+            return {"fault": None}
+
+    def set_vent_meter_bias(self, bias: float) -> dict:
+        """给放散流量计设置相对偏差（仿真/演练核对用）。"""
+
+        with self._lock:
+            self.vent_meter.set_bias(float(bias))
+            return {"bias": self.vent_meter.bias()}
+
+    def calibrate_vent_meter(self, factor: float) -> dict:
+        """现场重新标定放散流量计：叠加重标定系数，把偏差读数折算回真值口径。
+
+        偏差期间流量计多读了（如 +30%），标定系数传其倒数（1/1.3），真值
+        账不动、显示账被折算回与压力账一致；标定结果随检查点落盘，续放
+        恢复时只套一次。
+        """
+
+        with self._lock:
+            factor = float(factor)
+            self.vent_staging.apply_meter_calibration(factor)
+            self.bus.publish(
+                Event.of(
+                    "vent",
+                    "vent",
+                    "vent_meter_calibrated",
+                    station=self.unit,
+                    severity="warning",
+                    factor=factor,
+                    cal_factor=self.vent_meter.cal_factor(),
+                )
+            )
+            if self.vent_staging.is_hold():
+                self.store.write(VENT_CHECKPOINT_DOC, self.vent_staging.checkpoint().as_dict())
+            return {
+                "factor": factor,
+                "cal_factor": self.vent_meter.cal_factor(),
+                "total_kg": round(self.vent_meter.total_kg(), 3),
+            }
 
     def pressurize(
         self,
@@ -531,10 +658,23 @@ class Platform:
             self.leak.reset()
             self.dispenser.reset()
             self.queue.reset()
+            self.vent_meter.restore(0.0, 0.0, stage1_closed=False)
+            self.vent.clear_fault()
+            if self.vent.is_open():
+                self.vent.close()
+            if self.vent_latch.is_engaged():
+                self.vent_latch.release()
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
+            checkpoint_removed = (
+                self.store.remove(VENT_CHECKPOINT_DOC) if self.store.exists(VENT_CHECKPOINT_DOC) else False
+            )
             self._operations = 0
             self._cycles = 0
-            return {"platform_state_removed": removed, "store_root": self.store.root}
+            return {
+                "platform_state_removed": removed,
+                "vent_checkpoint_removed": checkpoint_removed,
+                "store_root": self.store.root,
+            }
 
     def truck_snapshot(self) -> dict:
         """返回槽车状态快照。"""
@@ -542,17 +682,38 @@ class Platform:
         return self.truck.snapshot().as_dict()
 
     def vent_snapshot(self) -> dict:
-        """返回放散状态快照。"""
+        """返回两段放散状态快照（每段排量两套账一起给）。"""
 
-        return VentSnapshot(
+        checkpoint = self.store.read(VENT_CHECKPOINT_DOC)
+        closed1 = self.vent_staging.stage_amount(1)
+        closed2 = self.vent_staging.stage_amount(2)
+        snapshot = VentSnapshot(
             open=self.vent.is_open(),
+            position=self.vent.position(),
+            stage=self.vent.stage(),
+            controller_state=self.vent_staging.state,
             latch_engaged=self.vent_latch.is_engaged(),
             latch_travel_mm=self.vent_latch.travel(),
             latch_cycles=self.vent_latch.cycles(),
             latch_resets=self.vent_latch.resets(),
             bursts=self.vent.bursts(),
+            switch_attempts=self.vent.switch_attempts(),
             vented_mpa=self.vent.vented_mpa(),
-        ).as_dict()
+            stage1_vented_mpa=self.vent.vented_mpa(1),
+            stage2_vented_mpa=self.vent.vented_mpa(2),
+            stage1_meter_kg=self.vent_meter.stage_kg(1),
+            stage2_meter_kg=self.vent_meter.stage_kg(2),
+            meter_total_kg=self.vent_meter.total_kg(),
+            switch_ok=self.vent_staging.last_switch_ok,
+            last_switch_reason=self.vent_staging.last_switch_reason,
+            reconciliation_ok=self.vent_staging.reconciliation_ok(),
+            resumable=isinstance(checkpoint, dict),
+        )
+        data = snapshot.as_dict()
+        # 已结清段附上两套账核对结论，控制台直接展示"这一段排掉多少、对没对上"。
+        data["stage1_closed"] = None if closed1 is None else closed1.as_dict()
+        data["stage2_closed"] = None if closed2 is None else closed2.as_dict()
+        return data
 
     def compressor_snapshot(self) -> dict:
         """返回压缩机状态快照。"""

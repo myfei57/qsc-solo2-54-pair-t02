@@ -98,6 +98,22 @@ class TruckMachine:
         self._vents += 1
         return self._pressure_mpa
 
+    def restore_pressure(self, pressure_mpa: float) -> None:
+        """按放散检查点重建软管压力（续放用）。
+
+        同进程续放时槽车还在已连接态；跨重启续放时状态机是空闲的，这里
+        一并把软管接回到"已连接、卸氢已结束"的工况，再恢复压力。
+        """
+
+        pressure = float(pressure_mpa)
+        if pressure < 0.0 or pressure > self._limits.hose_pressure_max_mpa:
+            raise PressureError("恢复的放散压力越界", component="truck")
+        if self._state == IDLE:
+            self._state = CONNECTED
+        if self._state != CONNECTED:
+            raise InterlockError("只有已连接状态才能恢复放散压力", component="truck")
+        self._pressure_mpa = pressure
+
     def discharge_ready(self) -> bool:
         """软管压力是否已降到可以拔管的水平。"""
 

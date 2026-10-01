@@ -27,7 +27,13 @@ def _section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     return value
 
 
-def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = None) -> float:
+def _number(
+    section: Mapping[str, Any],
+    key: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
     value = section.get(key, _MISSING)
     if value is _MISSING:
         raise ConfigError(f"配置缺少字段 {key!r}", component="config")
@@ -36,6 +42,8 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     number = float(value)
     if minimum is not None and number < minimum:
         raise ConfigError(f"配置字段 {key!r} 不得小于 {minimum}", component="config")
+    if maximum is not None and number > maximum:
+        raise ConfigError(f"配置字段 {key!r} 不得大于 {maximum}", component="config")
     return number
 
 
@@ -50,6 +58,17 @@ def _integer(section: Mapping[str, Any], key: str, *, minimum: int = 0) -> int:
     return value
 
 
+def _string(section: Mapping[str, Any], key: str, *, choices: tuple[str, ...] = ()) -> str:
+    value = section.get(key, _MISSING)
+    if value is _MISSING:
+        raise ConfigError(f"配置缺少字段 {key!r}", component="config")
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"配置字段 {key!r} 必须是非空字符串", component="config")
+    if choices and value not in choices:
+        raise ConfigError(f"配置字段 {key!r} 必须是 {choices} 之一", component="config")
+    return value
+
+
 @dataclass(frozen=True)
 class TruckLimits:
     """槽车卸氢压力与放散确认约束。"""
@@ -58,6 +77,7 @@ class TruckLimits:
     vent_confirm_mpa: float
     vent_timeout_s: float
     unload_rate_kg_per_min: float
+    vent_kg_per_mpa: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "TruckLimits":
@@ -66,6 +86,7 @@ class TruckLimits:
             vent_confirm_mpa=_number(section, "vent_confirm_mpa", minimum=0.0),
             vent_timeout_s=_number(section, "vent_timeout_s", minimum=1.0),
             unload_rate_kg_per_min=_number(section, "unload_rate_kg_per_min", minimum=0.1),
+            vent_kg_per_mpa=_number(section, "vent_kg_per_mpa", minimum=0.01),
         )
         if limits.vent_confirm_mpa >= limits.hose_pressure_max_mpa:
             raise ConfigError("放散确认压力必须小于软管最高压力", component="config")
@@ -76,33 +97,69 @@ class TruckLimits:
 
         return pressure_mpa <= self.vent_confirm_mpa
 
+    def vent_mass_kg(self, drop_mpa: float) -> float:
+        """把压降折算成放散质量，供流量计账与压力账两套账对照。"""
+
+        return max(0.0, float(drop_mpa)) * self.vent_kg_per_mpa
+
 
 @dataclass(frozen=True)
 class VentLimits:
-    """放散阀孔径与闩锁约束。"""
+    """两段放散阀孔径、切段压力与核对约束。
+
+    放散顺序定死为"先大后小"：``orifice_mm`` 是大流量段（一段）孔径，
+    ``small_orifice_mm`` 是小流量收尾段（二段）孔径；压力降到
+    ``switch_mpa`` 才允许由大切小。``switch_policy`` 按管路选择切段失败
+    策略：``revert`` 退回大流量段继续放散，``hold`` 停在当前段报警。
+    """
 
     orifice_mm: float
+    small_orifice_mm: float
     rate_coeff: float
     ambient_mpa: float
     latch_travel_mm: float
+    switch_mpa: float
+    switch_timeout_s: float
+    switch_policy: str
+    rate_band: float
+    switch_max_attempts: int
+    reconcile_tolerance: float
+    stage1_timeout_s: float
+    stage2_timeout_s: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "VentLimits":
         limits = cls(
             orifice_mm=_number(section, "orifice_mm", minimum=0.5),
+            small_orifice_mm=_number(section, "small_orifice_mm", minimum=0.1),
             rate_coeff=_number(section, "rate_coeff", minimum=0.1),
             ambient_mpa=_number(section, "ambient_mpa", minimum=0.0),
             latch_travel_mm=_number(section, "latch_travel_mm", minimum=1.0),
+            switch_mpa=_number(section, "switch_mpa", minimum=0.0),
+            switch_timeout_s=_number(section, "switch_timeout_s", minimum=0.1),
+            switch_policy=_string(section, "switch_policy", choices=("revert", "hold")),
+            rate_band=_number(section, "rate_band", minimum=0.01),
+            switch_max_attempts=_integer(section, "switch_max_attempts", minimum=1),
+            reconcile_tolerance=_number(section, "reconcile_tolerance", minimum=0.0, maximum=0.99),
+            stage1_timeout_s=_number(section, "stage1_timeout_s", minimum=1.0),
+            stage2_timeout_s=_number(section, "stage2_timeout_s", minimum=1.0),
         )
         if limits.rate_coeff > 1.0:
             raise ConfigError("放散系数不得超过 1.0", component="config")
+        if limits.small_orifice_mm >= limits.orifice_mm:
+            raise ConfigError("小流量段孔径必须小于大流量段孔径（放散顺序定死为先大后小）", component="config")
+        if limits.reconcile_tolerance >= 1.0:
+            raise ConfigError("排量核对公差必须小于 1.0", component="config")
+        if limits.switch_mpa <= limits.ambient_mpa:
+            raise ConfigError("切段压力必须高于常压，否则小流量收尾段没有工作区间", component="config")
         return limits
 
-    def vent_rate_mpa_per_s(self, pressure_mpa: float) -> float:
+    def vent_rate_mpa_per_s(self, pressure_mpa: float, *, small: bool = False) -> float:
         """按孔口流量估算的压降速率，压力越低放散越慢。"""
 
         overpressure = max(0.0, pressure_mpa - self.ambient_mpa)
-        return self.rate_coeff * self.orifice_mm * overpressure / 100.0
+        orifice = self.small_orifice_mm if small else self.orifice_mm
+        return self.rate_coeff * orifice * overpressure / 100.0
 
 
 @dataclass(frozen=True)
@@ -301,11 +358,18 @@ class StationConfig:
             raise ConfigError("station.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        truck = TruckLimits.from_mapping(_section(limits, "truck"))
+        vent = VentLimits.from_mapping(_section(limits, "vent"))
+        if vent.switch_mpa <= truck.vent_confirm_mpa:
+            raise ConfigError(
+                "切段压力必须高于放散确认压力，否则小流量收尾段没有工作区间",
+                component="config",
+            )
         return cls(
             name=name,
             storage_root=storage_root,
-            truck=TruckLimits.from_mapping(_section(limits, "truck")),
-            vent=VentLimits.from_mapping(_section(limits, "vent")),
+            truck=truck,
+            vent=vent,
             compressor=CompressorLimits.from_mapping(_section(limits, "comp")),
             buffer=BufferLimits.from_mapping(_section(limits, "buffer")),
             cool=CoolLimits.from_mapping(_section(limits, "cool")),
@@ -334,8 +398,22 @@ def default_config() -> StationConfig:
     return StationConfig(
         name="refueling-control",
         storage_root="var/state",
-        truck=TruckLimits(25.0, 1.5, 90.0, 6.0),
-        vent=VentLimits(6.0, 0.9, 0.1, 40.0),
+        truck=TruckLimits(25.0, 1.5, 90.0, 6.0, 0.6),
+        vent=VentLimits(
+            orifice_mm=6.0,
+            small_orifice_mm=1.5,
+            rate_coeff=0.9,
+            ambient_mpa=0.1,
+            latch_travel_mm=40.0,
+            switch_mpa=5.0,
+            switch_timeout_s=10.0,
+            switch_policy="revert",
+            rate_band=0.25,
+            switch_max_attempts=2,
+            reconcile_tolerance=0.1,
+            stage1_timeout_s=90.0,
+            stage2_timeout_s=240.0,
+        ),
         compressor=CompressorLimits(3.0, 43.0, 0.8, 1.2, 1.5),
         buffer=BufferLimits(42.0, 1.5, 3600.0, 350.0),
         cool=CoolLimits(-40.0, 3.0, 0.6, 20.0),
@@ -357,12 +435,22 @@ def config_to_mapping(cfg: StationConfig) -> dict:
                 "vent_confirm_mpa": cfg.truck.vent_confirm_mpa,
                 "vent_timeout_s": cfg.truck.vent_timeout_s,
                 "unload_rate_kg_per_min": cfg.truck.unload_rate_kg_per_min,
+                "vent_kg_per_mpa": cfg.truck.vent_kg_per_mpa,
             },
             "vent": {
                 "orifice_mm": cfg.vent.orifice_mm,
+                "small_orifice_mm": cfg.vent.small_orifice_mm,
                 "rate_coeff": cfg.vent.rate_coeff,
                 "ambient_mpa": cfg.vent.ambient_mpa,
                 "latch_travel_mm": cfg.vent.latch_travel_mm,
+                "switch_mpa": cfg.vent.switch_mpa,
+                "switch_timeout_s": cfg.vent.switch_timeout_s,
+                "switch_policy": cfg.vent.switch_policy,
+                "rate_band": cfg.vent.rate_band,
+                "switch_max_attempts": cfg.vent.switch_max_attempts,
+                "reconcile_tolerance": cfg.vent.reconcile_tolerance,
+                "stage1_timeout_s": cfg.vent.stage1_timeout_s,
+                "stage2_timeout_s": cfg.vent.stage2_timeout_s,
             },
             "comp": {
                 "inlet_min_mpa": cfg.compressor.inlet_min_mpa,
